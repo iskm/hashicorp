@@ -1,0 +1,124 @@
+---
+- name: Validate every node before any changes
+  hosts: vault_nodes
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  tasks:
+    - name: Include encrypted credentials on controller
+      ansible.builtin.include_vars:
+        file: "{{ vault_secrets_file }}"
+      no_log: true
+    - name: Require supported deployment and deliberate restart choice
+      ansible.builtin.assert:
+        that:
+          - ansible_service_mgr == 'systemd'
+          - vault_mode in ['apply', 'verify']
+          - not ansible_check_mode
+          - vault_mode != 'apply' or vault_restart_allowed | bool
+          - vault_node_url is match('^https://')
+          - vault_api_url is match('^https://')
+          - vault_storage_type in ['raft', 'external']
+          - vault_user != 'root'
+          - vault_audit_mount is match('^[a-zA-Z0-9_-]+$')
+        fail_msg: Use vault_mode=verify for read-only validation; --check is intentionally unsupported.
+    - name: Require credential without printing it
+      ansible.builtin.assert:
+        that: vault_admin_token | default('') | length > 0
+      no_log: true
+    - name: Check direct node health with certificate validation
+      ansible.builtin.uri:
+        url: "{{ vault_node_url }}/v1/sys/health"
+        ca_path: "{{ vault_ca_path }}"
+        validate_certs: true
+        use_proxy: false
+        follow_redirects: none
+        status_code: [200, 429, 473]
+      register: initial_health
+      changed_when: false
+    - name: Require initialized unsealed nodes in the same primary cluster
+      ansible.builtin.assert:
+        that:
+          - initial_health.json.initialized | bool
+          - not initial_health.json.sealed | bool
+          - initial_health.json.replication_dr_mode | default('disabled') != 'secondary'
+          - initial_health.json.cluster_id == hostvars[groups['vault_nodes'][0]].initial_health.json.cluster_id
+    - name: Inspect seal type before any apply operation
+      ansible.builtin.uri:
+        url: "{{ vault_node_url }}/v1/sys/seal-status"
+        ca_path: "{{ vault_ca_path }}"
+        validate_certs: true
+        use_proxy: false
+        follow_redirects: none
+        status_code: 200
+      register: preflight_seal
+      changed_when: false
+    - name: Require threshold shares BEFORE restarting Shamir nodes
+      ansible.builtin.assert:
+        that:
+          - vault_unseal_after_restart | bool
+          - vault_unseal_keys | default([]) | length >= preflight_seal.json.t | int
+      when: vault_mode == 'apply' and preflight_seal.json.type == 'shamir'
+      no_log: true
+    - name: Check cluster membership and quorum before changes
+      ansible.builtin.include_tasks: tasks/raft.yml
+      run_once: true
+      when: vault_storage_type == 'raft'
+
+- name: Harden and verify nodes one at a time
+  hosts: vault_nodes
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: true
+  tasks:
+    - name: Apply host baseline
+      ansible.builtin.include_tasks: tasks/harden.yml
+      when: vault_mode == 'apply'
+    - name: Verify host and direct TLS baseline
+      ansible.builtin.script:
+        cmd: >-
+          files/verify_node.py
+          {{ vault_service | quote }} {{ vault_user | quote }}
+          {{ vault_binary | quote }} {{ vault_config_dir | quote }}
+          {{ vault_data_dir | quote }} {{ vault_tls_key | quote }}
+          {{ vault_audit_dir | quote }} {{ vault_node_url | quote }}
+          {{ vault_ca_path | quote }} {{ vault_min_version | quote }}
+          {{ (vault_require_hsts | bool) | ternary('yes','no') }}
+          {{ (vault_require_mac | bool) | ternary('yes','no') }}
+          {{ vault_storage_type | quote }}
+        executable: /usr/bin/python3
+      register: node_verification
+      changed_when: false
+    - name: Show sanitized node verification
+      ansible.builtin.debug:
+        msg: "{{ node_verification.stdout | from_json }}"
+    - name: Require every node baseline check to pass
+      ansible.builtin.assert:
+        that: (node_verification.stdout | from_json).passed | bool
+        fail_msg: Review the sanitized checks immediately above; remaining nodes have not been changed.
+    - name: Check cluster membership after this node
+      ansible.builtin.include_tasks: tasks/raft.yml
+      when: vault_storage_type == 'raft'
+
+- name: Apply and verify cluster controls once after all nodes are ready
+  hosts: vault_nodes
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Run cluster controls once
+      ansible.builtin.include_tasks: tasks/cluster.yml
+      run_once: true
+    - name: Confirm audit file exists on every node
+      ansible.builtin.stat:
+        path: "{{ vault_audit_file }}"
+      register: audit_stat
+    - name: Require private writable audit log on every node
+      ansible.builtin.assert:
+        that:
+          - audit_stat.stat.exists
+          - audit_stat.stat.isreg
+          - audit_stat.stat.pw_name == vault_user
+          - audit_stat.stat.mode == '0600'
+        fail_msg: Audit path must exist privately on every node, including standbys.

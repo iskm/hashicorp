@@ -1,0 +1,102 @@
+---
+- name: Read existing audit devices
+  ansible.builtin.uri:
+    url: "{{ vault_api_url }}/v1/sys/audit"
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    headers:
+      X-Vault-Token: "{{ vault_admin_token }}"
+    status_code: 200
+  register: audit_devices
+  changed_when: false
+  no_log: true
+- name: Enable managed file audit device if absent
+  ansible.builtin.uri:
+    url: "{{ vault_api_url }}/v1/sys/audit/{{ vault_audit_mount }}"
+    method: PUT
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    headers:
+      X-Vault-Token: "{{ vault_admin_token }}"
+    body_format: json
+    body:
+      type: file
+      options:
+        file_path: "{{ vault_audit_file }}"
+        mode: '0600'
+        log_raw: 'false'
+        hmac_accessor: 'true'
+    status_code: 204
+  changed_when: true
+  when: vault_mode == 'apply' and (vault_audit_mount + '/') not in audit_devices.json.data
+  no_log: true
+- name: Re-read audit device state
+  ansible.builtin.uri:
+    url: "{{ vault_api_url }}/v1/sys/audit"
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    headers:
+      X-Vault-Token: "{{ vault_admin_token }}"
+    status_code: 200
+  register: audit_verified
+  changed_when: false
+  no_log: true
+- name: Verify managed audit path and hashing (fail on existing conflicts)
+  ansible.builtin.assert:
+    that:
+      - (vault_audit_mount + '/') in audit_verified.json.data
+      - audit_verified.json.data[vault_audit_mount + '/'].type == 'file'
+      - audit_verified.json.data[vault_audit_mount + '/'].options.file_path == vault_audit_file
+      - audit_verified.json.data[vault_audit_mount + '/'].options.log_raw | default('false') | string | lower == 'false'
+      - audit_verified.json.data[vault_audit_mount + '/'].options.hmac_accessor | default('true') | string | lower == 'true'
+  no_log: true
+- name: Read running sanitized configuration (cluster endpoint may forward to active)
+  ansible.builtin.uri:
+    url: "{{ vault_api_url }}/v1/sys/config/state/sanitized"
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    headers:
+      X-Vault-Token: "{{ vault_admin_token }}"
+    status_code: 200
+  register: running_config
+  changed_when: false
+  no_log: true
+- name: Normalize sanitized config response envelope across versions
+  ansible.builtin.set_fact:
+    sanitized_config: "{{ running_config.json.data | default(running_config.json) }}"
+  no_log: true
+- name: Verify each active configuration listener enables TLS
+  ansible.builtin.assert:
+    that:
+      - item.type == 'tcp'
+      - not (item.config.tls_disable | default(false) | bool)
+      - item.config.tls_min_version | default('tls12') in ['tls12', 'tls13']
+      - not (item.config.telemetry.unauthenticated_metrics_access | default(false) | bool)
+      - not (item.config.profiling.unauthenticated_pprof_access | default(false) | bool)
+  loop: "{{ sanitized_config.listeners }}"
+  no_log: true
+- name: Verify production configuration
+  ansible.builtin.assert:
+    that:
+      - sanitized_config.listeners | length > 0
+      - sanitized_config.storage.type not in ['inmem']
+      - not (sanitized_config.raw_storage_endpoint | default(false) | bool)
+      - vault_storage_type != 'raft' or sanitized_config.storage.type == 'raft'
+  no_log: true
+- name: Tune and verify explicitly selected supported auth mounts
+  ansible.builtin.include_tasks: lockout.yml
+  loop: "{{ vault_lockout_mounts }}"
+  loop_control:
+    loop_var: auth_mount
+  when: vault_lockout_mounts | length > 0
+- name: State successful cluster verification scope
+  ansible.builtin.debug:
+    msg: Audit device, active listener configuration, and selected auth mounts passed. External controls require the README checklist.

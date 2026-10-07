@@ -1,0 +1,75 @@
+---
+- name: Require supported lockout mount type
+  ansible.builtin.uri:
+    url: "{{ vault_api_url }}/v1/sys/auth/{{ auth_mount | trim('/') }}"
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    headers:
+      X-Vault-Token: "{{ vault_admin_token }}"
+    status_code: 200
+  register: auth_info
+  changed_when: false
+  no_log: true
+- name: Check lockout is supported
+  ansible.builtin.assert:
+    that: auth_info.json.data.type in ['userpass', 'approle', 'ldap']
+  no_log: true
+- name: Read auth mount tune
+  ansible.builtin.uri:
+    url: "{{ vault_api_url }}/v1/sys/auth/{{ auth_mount | trim('/') }}/tune"
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    headers:
+      X-Vault-Token: "{{ vault_admin_token }}"
+    status_code: 200
+  register: lockout_before
+  changed_when: false
+  no_log: true
+- name: Apply deliberate lockout settings
+  ansible.builtin.uri:
+    url: "{{ vault_api_url }}/v1/sys/auth/{{ auth_mount | trim('/') }}/tune"
+    method: POST
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    headers:
+      X-Vault-Token: "{{ vault_admin_token }}"
+    body_format: json
+    body:
+      user_lockout_config:
+        lockout_threshold: "{{ vault_lockout.lockout_threshold | string }}"
+        lockout_duration: "{{ vault_lockout.lockout_duration | string }}s"
+        lockout_counter_reset: "{{ vault_lockout.lockout_counter_reset | string }}s"
+        lockout_disable: "{{ vault_lockout.lockout_disable | bool }}"
+    status_code: 204
+  when: vault_mode == 'apply' and vault_manage_lockout | bool and ((lockout_before.json.data.user_lockout_config | default({})).lockout_threshold | default(0) | int != vault_lockout.lockout_threshold | int or (lockout_before.json.data.user_lockout_config | default({})).lockout_duration | default(0) | int != vault_lockout.lockout_duration | int or (lockout_before.json.data.user_lockout_config | default({})).lockout_counter_reset | default(0) | int != vault_lockout.lockout_counter_reset | int or (lockout_before.json.data.user_lockout_config | default({})).lockout_disable | default(true) | bool != vault_lockout.lockout_disable | bool)
+  changed_when: true
+  no_log: true
+- name: Re-read effective lockout state
+  ansible.builtin.uri:
+    url: "{{ vault_api_url }}/v1/sys/auth/{{ auth_mount | trim('/') }}/tune"
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    headers:
+      X-Vault-Token: "{{ vault_admin_token }}"
+    status_code: 200
+  register: lockout_after
+  changed_when: false
+  no_log: true
+- name: Require explicit non-disabled lockout configuration
+  ansible.builtin.assert:
+    that:
+      - lockout_after.json.data.user_lockout_config is defined
+      - not (lockout_after.json.data.user_lockout_config.lockout_disable | default(true) | bool)
+      - lockout_after.json.data.user_lockout_config.lockout_threshold | int == vault_lockout.lockout_threshold | int
+      - lockout_after.json.data.user_lockout_config.lockout_duration | int == vault_lockout.lockout_duration | int
+      - lockout_after.json.data.user_lockout_config.lockout_counter_reset | int == vault_lockout.lockout_counter_reset | int
+    fail_msg: Explicit lockout state is required; configure mount settings rather than relying on inferred defaults.
+  no_log: true

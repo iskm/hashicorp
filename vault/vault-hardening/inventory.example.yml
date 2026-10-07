@@ -1,0 +1,16 @@
+all:
+  children:
+    vault_nodes:
+      hosts:
+        vault1:
+          ansible_host: 10.0.10.11
+          vault_node_url: https://vault1.example.com:8200
+          vault_raft_node_id: vault1
+        vault2:
+          ansible_host: 10.0.10.12
+          vault_node_url: https://vault2.example.com:8200
+          vault_raft_node_id: vault2
+        vault3:
+          ansible_host: 10.0.10.13
+          vault_node_url: https://vault3.example.com:8200
+          vault_raft_node_id: vault3

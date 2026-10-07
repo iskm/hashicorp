@@ -1,0 +1,32 @@
+# Existing, initialized Linux/systemd cluster; adjust ALL paths to your installation.
+vault_mode: verify                        # apply | verify
+vault_service: vault
+vault_user: vault
+vault_group: vault
+vault_binary: /usr/bin/vault
+vault_config_dir: /etc/vault.d
+vault_data_dir: /opt/vault/data
+vault_tls_key: /etc/vault.d/tls/vault-key.pem
+vault_audit_dir: /var/log/vault
+vault_audit_file: /var/log/vault/audit.json
+vault_audit_mount: hardening-file
+vault_storage_type: raft                  # raft | external
+vault_expected_voters: 3
+vault_min_version: '1.21.0'                # Set to your approved patched release; no upgrade performed.
+vault_api_url: https://vault.example.com:8200
+# Both paths are on the managed hosts (API calls run from there).
+vault_ca_path: /etc/vault.d/tls/ca.pem
+vault_secrets_file: vars/secrets.yml
+vault_restart_allowed: false              # apply requires explicit true
+vault_manage_chrony: false                # Existing synchronized time service accepted.
+vault_chrony_service: "{{ 'chronyd' if ansible_os_family == 'RedHat' else 'chrony' }}"
+vault_unseal_after_restart: true          # Only Shamir keys, never KMS recovery keys.
+vault_require_hsts: false                 # Enable after configuring listener custom_response_headers.
+vault_require_mac: false                  # Require active SELinux enforcing OR AppArmor if true.
+vault_manage_lockout: false               # Optional cluster-wide auth tuning, root namespace only.
+vault_lockout_mounts: []                   # e.g. ['userpass', 'approle', 'ldap']
+vault_lockout:
+  lockout_threshold: '5'
+  lockout_duration: 900
+  lockout_counter_reset: 900
+  lockout_disable: false

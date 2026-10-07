@@ -1,0 +1,41 @@
+---
+- name: Read integrated-storage membership through cluster endpoint
+  ansible.builtin.uri:
+    url: "{{ vault_api_url }}/v1/sys/storage/raft/configuration"
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    headers:
+      X-Vault-Token: "{{ vault_admin_token }}"
+    status_code: 200
+  register: raft_configuration
+  changed_when: false
+  no_log: true
+- name: Validate voter count, leader count, and inventory node IDs
+  ansible.builtin.assert:
+    that:
+      - raft_configuration.json.data.config.servers | selectattr('voter', 'equalto', true) | list | length == vault_expected_voters | int
+      - raft_configuration.json.data.config.servers | selectattr('leader', 'equalto', true) | list | length == 1
+      - groups['vault_nodes'] | map('extract', hostvars, 'vault_raft_node_id') | list | difference(raft_configuration.json.data.config.servers | map(attribute='node_id') | list) | length == 0
+  no_log: true
+
+- name: Wait for healthy Raft autopilot state and available failure tolerance
+  ansible.builtin.uri:
+    url: "{{ vault_api_url }}/v1/sys/storage/raft/autopilot/state"
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    headers:
+      X-Vault-Token: "{{ vault_admin_token }}"
+    status_code: 200
+  register: autopilot_state
+  until: >-
+    autopilot_state.status | default(0) == 200 and
+    ((autopilot_state.json.data | default(autopilot_state.json)).healthy | default(false) | bool) and
+    ((autopilot_state.json.data | default(autopilot_state.json)).failure_tolerance | default(0) | int >= 1)
+  retries: 30
+  delay: 2
+  changed_when: false
+  no_log: true

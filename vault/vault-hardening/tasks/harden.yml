@@ -1,0 +1,246 @@
+---
+# No config replacement, initialization, peer changes, SSH removal or root-token revocation.
+- name: Require dedicated service account to exist
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ vault_user }}"
+- name: Protect configuration directory without recursive ownership changes
+  ansible.builtin.file:
+    path: "{{ vault_config_dir }}"
+    state: directory
+    owner: root
+    group: "{{ vault_group }}"
+    mode: '0750'
+- name: Locate configuration subdirectories
+  ansible.builtin.find:
+    paths: "{{ vault_config_dir }}"
+    file_type: directory
+    recurse: true
+  register: config_directories
+- name: Protect configuration subdirectories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: root
+    group: "{{ vault_group }}"
+    mode: '0750'
+  loop: "{{ config_directories.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+- name: Locate configuration files
+  ansible.builtin.find:
+    paths: "{{ vault_config_dir }}"
+    patterns: ['*.hcl', '*.json']
+    file_type: file
+    recurse: true
+  register: config_files
+- name: Make config files root-owned and service-readable
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: root
+    group: "{{ vault_group }}"
+    mode: '0640'
+  loop: "{{ config_files.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+- name: Protect Vault executable
+  ansible.builtin.file:
+    path: "{{ vault_binary }}"
+    owner: root
+    group: root
+    mode: '0755'
+    follow: true
+- name: Protect TLS private key
+  ansible.builtin.file:
+    path: "{{ vault_tls_key }}"
+    owner: root
+    group: "{{ vault_group }}"
+    mode: '0640'
+- name: Restrict integrated-storage directory (retain child ownership)
+  ansible.builtin.file:
+    path: "{{ vault_data_dir }}"
+    state: directory
+    owner: "{{ vault_user }}"
+    group: "{{ vault_group }}"
+    mode: '0700'
+  when: vault_storage_type == 'raft'
+- name: Create private audit directory on every node BEFORE enabling audit
+  ansible.builtin.file:
+    path: "{{ vault_audit_dir }}"
+    state: directory
+    owner: "{{ vault_user }}"
+    group: "{{ vault_group }}"
+    mode: '0700'
+- name: Precreate audit log without truncating it
+  ansible.builtin.copy:
+    content: ''
+    dest: "{{ vault_audit_file }}"
+    force: false
+    owner: "{{ vault_user }}"
+    group: "{{ vault_group }}"
+    mode: '0600'
+- name: Correct existing audit log permissions
+  ansible.builtin.file:
+    path: "{{ vault_audit_file }}"
+    owner: "{{ vault_user }}"
+    group: "{{ vault_group }}"
+    mode: '0600'
+- name: Read active swap
+  ansible.builtin.command: swapon --noheadings --show=NAME
+  register: swap_before
+  changed_when: false
+- name: Disable active swap (dedicated nodes only)
+  ansible.builtin.command: swapoff -a
+  when: swap_before.stdout | trim | length > 0
+- name: Disable fstab swap persistently
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^(\s*[^#\s]+\s+\S+\s+swap\s+.*)$'
+    replace: '# vault-hardening disabled swap: \1'
+    backup: true
+- name: Prevent systemd-generated or explicit swap units from reactivating
+  ansible.builtin.command: systemctl list-units --type=swap --all --plain --no-legend
+  register: swap_units
+  changed_when: false
+- name: Mask discovered swap units
+  ansible.builtin.systemd_service:
+    name: "{{ item.split()[0] }}"
+    masked: true
+    state: stopped
+  loop: "{{ swap_units.stdout_lines }}"
+  when: item.split() | length > 0
+- name: Set persistent core-dump sysctl
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-vault-hardening.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      fs.suid_dumpable = 0
+- name: Read core-dump sysctl
+  ansible.builtin.command: sysctl -n fs.suid_dumpable
+  register: core_sysctl
+  changed_when: false
+- name: Apply core-dump sysctl
+  ansible.builtin.command: sysctl -w fs.suid_dumpable=0
+  when: core_sysctl.stdout | trim != '0'
+- name: Optionally install time synchronization
+  ansible.builtin.package:
+    name: chrony
+    state: present
+  when: vault_manage_chrony | bool
+- name: Optionally enable time synchronization
+  ansible.builtin.systemd_service:
+    name: "{{ vault_chrony_service }}"
+    enabled: true
+    state: started
+  when: vault_manage_chrony | bool
+- name: Install log rotation utility
+  ansible.builtin.package:
+    name: logrotate
+    state: present
+- name: Configure audit rotation with reopen signal (no copytruncate)
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/vault-hardening
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      {{ vault_audit_file }} {
+          daily
+          rotate 14
+          missingok
+          notifempty
+          compress
+          delaycompress
+          create 0600 {{ vault_user }} {{ vault_group }}
+          su {{ vault_user }} {{ vault_group }}
+          sharedscripts
+          postrotate
+              /bin/systemctl kill --kill-who=main --signal=HUP {{ vault_service }}.service
+          endscript
+      }
+- name: Create service override directory
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ vault_service }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+- name: Install service sandbox and resource limits
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ vault_service }}.service.d/90-hardening.conf"
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Service]
+      User={{ vault_user }}
+      Group={{ vault_group }}
+      UMask=0077
+      LimitCORE=0
+      LimitNOFILE=65536
+      LimitMEMLOCK=infinity
+      NoNewPrivileges=yes
+      PrivateTmp=yes
+      PrivateDevices=yes
+      ProtectSystem=full
+      ProtectHome=read-only
+      CapabilityBoundingSet=CAP_SYSLOG CAP_IPC_LOCK
+      AmbientCapabilities=CAP_IPC_LOCK
+      ReadOnlyPaths={{ vault_config_dir }} {{ vault_binary }}
+  register: service_override
+- name: Restart only when service override changed
+  ansible.builtin.systemd_service:
+    name: "{{ vault_service }}"
+    daemon_reload: true
+    state: restarted
+  when: service_override.changed
+- name: Wait for direct node API after possible restart
+  ansible.builtin.uri:
+    url: "{{ vault_node_url }}/v1/sys/seal-status"
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    status_code: 200
+  register: seal_status
+  until: seal_status.status | default(0) == 200
+  retries: 30
+  delay: 2
+  changed_when: false
+- name: Require enough actual Shamir unseal shares if node sealed
+  ansible.builtin.assert:
+    that:
+      - vault_unseal_after_restart | bool
+      - vault_unseal_keys | default([]) | length >= seal_status.json.t | int
+    fail_msg: Supply threshold Shamir shares in encrypted include_vars, or unseal out of band.
+  when: seal_status.json.sealed and seal_status.json.type == 'shamir'
+  no_log: true
+- name: Unseal only sealed Shamir nodes via HTTPS body
+  ansible.builtin.uri:
+    url: "{{ vault_node_url }}/v1/sys/unseal"
+    method: PUT
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    body_format: json
+    body:
+      key: "{{ item }}"
+    status_code: 200
+  loop: "{{ (vault_unseal_keys | default([]))[:seal_status.json.t | int] }}"
+  when: seal_status.json.sealed and seal_status.json.type == 'shamir'
+  no_log: true
+- name: Wait until initialized unsealed and serving (includes auto-unseal)
+  ansible.builtin.uri:
+    url: "{{ vault_node_url }}/v1/sys/health"
+    ca_path: "{{ vault_ca_path }}"
+    validate_certs: true
+    use_proxy: false
+    follow_redirects: none
+    status_code: [200, 429, 473, 503]
+  register: ready
+  until: ready.status | default(0) in [200, 429, 473] and not (ready.json.sealed | default(true))
+  retries: 60
+  delay: 2
+  changed_when: false
